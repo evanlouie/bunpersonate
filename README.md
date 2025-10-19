@@ -18,33 +18,29 @@ Install the `curl-impersonate` shared libraries (`libcurl-impersonate-chrome` an
 bun install
 ```
 
-## Quick start
+## Quick start (Fetch-compatible API)
 
 ```ts
-import { impersonatedRequest } from "./index.ts";
+import { fetchImpersonated } from "./index.ts";
 
-const response = await impersonatedRequest({
-  url: "https://www.example.com",
+const response = await fetchImpersonated("https://www.example.com", {
   target: "chrome124", // any curl-impersonate target string
   headers: {
     "Accept-Language": "en-US,en;q=0.9",
   },
-  followRedirects: true,
+  redirect: "follow",
   timeoutMs: 10_000,
 });
 
-console.log(response.statusCode);
-console.log(new TextDecoder().decode(response.body));
+console.log(response.status, response.redirected, response.url);
+console.log(await response.text());
 ```
 
-`impersonatedRequest` automatically:
+`fetchImpersonated` mirrors the WHATWG Fetch API: it accepts any `RequestInfo` + `RequestInit`, honors `redirect`, `signal`, and standard body types, and returns a real `Response` with `Headers` support. The only required extension is `init.target`, which selects the curl-impersonate browser profile.
 
-- Loads the `libcurl-impersonate-*.{so,dylib}` shared library.
-- Calls `curl_global_init()` once per process.
-- Applies the impersonation profile using `curl_easy_impersonate()`.
-- Collects the response body and headers into Bun-friendly data structures.
+## Low-level helper
 
-### Advanced usage
+`impersonatedRequest` remains available when you want direct access to the raw buffers or need to integrate with the underlying FFI primitives.
 
 ```ts
 import {
@@ -80,8 +76,10 @@ try {
 bun test
 ```
 
-The default test suite exercises library loading in the Bun test runner. For an end-to-end real HTTP check, run the standalone smoke test (kept separate because Bun's test workers currently abort when performing networked FFI calls):
+The default test suite exercises library loading and the fetch-style helpers in the Bun test runner using lightweight unit tests. To run everything, including the end-to-end smoke check, use:
 
 ```bash
-bun run test/smoke.ts
+bun run test:all
 ```
+
+That command runs `bun test` followed by the smoke script (which covers both `impersonatedRequest` and `fetchImpersonated`). The smoke test remains in a separate process because Bun's test workers may still crash on network-heavy FFI calls.

@@ -16,6 +16,7 @@ Default to using Bun instead of Node.js.
   - `bun run typecheck` (runs `tsc --noEmit`)
   - `bun run format` (Prettier check)
   - `bun run format:write` (Prettier write)
+  - `bun run test:all` (runs unit tests plus smoke test)
 - Keep this document current whenever workflows or scripts change.
 - Keep README.md current whenever workflows, scripts, or capabilities change.
 - Use Conventional Commits (`type: scope - message`) when authoring commit messages.
@@ -33,6 +34,8 @@ Default to using Bun instead of Node.js.
 ## Testing
 
 Use `bun test` to run tests.
+
+For full coverage (unit tests + smoke HTTP check) run `bun run test:all`.
 
 ```ts#index.test.ts
 import { test, expect } from "bun:test";

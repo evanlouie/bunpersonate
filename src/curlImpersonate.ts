@@ -66,6 +66,10 @@ export interface ImpersonatedRequestOptions {
    */
   headers?: Record<string, string>;
   /**
+   * Preformatted HTTP header lines. When provided, takes precedence over `headers`.
+   */
+  headerList?: string[];
+  /**
    * HTTP method, defaults to GET. For POST/PUT/PATCH supply a body.
    */
   method?: string;
@@ -86,6 +90,18 @@ export interface ImpersonatedRequestOptions {
    * Disable TLS verification (not recommended, defaults to false).
    */
   insecureSkipVerify?: boolean;
+  /**
+   * Abort signal compatible with WHATWG Fetch APIs.
+   */
+  abortSignal?: AbortSignal | null;
+}
+
+export interface ImpersonatedFetchInit extends RequestInit {
+  target: CurlBrowserTarget;
+  defaultHeaders?: boolean;
+  timeoutMs?: number;
+  insecureSkipVerify?: boolean;
+  loadOptions?: LoadCurlImpersonateOptions;
 }
 
 /**
@@ -101,6 +117,7 @@ export interface ImpersonatedResponse {
 type CurlCode = number;
 
 const CURLE_BAD_FUNCTION_ARGUMENT = 43;
+const CURLE_ABORTED_BY_CALLBACK = 42;
 
 const CURL_GLOBAL_DEFAULT = 3; // curl/curl.h -> CURL_GLOBAL_SSL | CURL_GLOBAL_WIN32
 const CURLINFO_RESPONSE_CODE = 0x200000 + 2;
@@ -132,6 +149,8 @@ const enum CurlOption {
   HTTP_VERSION = 84,
   SSL_VERIFYPEER = 64,
   SSL_VERIFYHOST = 81,
+  XFERINFOFUNCTION = 20219,
+  XFERINFODATA = 10057,
 }
 
 const curlLibrarySymbols = {
@@ -508,11 +527,18 @@ function getInfoPointer(
   return shim.curl_easy_getinfo_ptr_shim(handle, info, out);
 }
 
+interface AbortState {
+  aborted: boolean;
+  reason?: unknown;
+}
+
 interface PerformContext {
   responseChunks: Uint8Array[];
   headerLines: string[];
   headerBuffer: string;
   headerDecoder: TextDecoder;
+  abortState?: AbortState;
+  abortCleanup?: (() => void) | null;
 }
 
 function createWriteCallback(ctx: PerformContext) {
@@ -563,6 +589,27 @@ function createHeaderCallback(ctx: PerformContext) {
   );
 }
 
+function createProgressCallback(ctx: PerformContext) {
+  return new JSCallback(
+    (
+      _client: Pointer,
+      _dltotal: bigint,
+      _dlnow: bigint,
+      _ultotal: bigint,
+      _ulnow: bigint,
+    ) => {
+      if (ctx.abortState?.aborted) {
+        return 1;
+      }
+      return 0;
+    },
+    {
+      returns: "int",
+      args: ["pointer", "int64_t", "int64_t", "int64_t", "int64_t"],
+    },
+  );
+}
+
 /**
  * Perform an HTTP request with curl-impersonate, applying the selected browser profile
  * and wiring the response into Bun-friendly data structures.
@@ -588,6 +635,7 @@ export async function impersonatedRequest(
     headerLines: [],
     headerBuffer: "",
     headerDecoder: new TextDecoder(),
+    abortCleanup: null,
   };
 
   const writeCallback = createWriteCallback(ctx);
@@ -599,7 +647,59 @@ export async function impersonatedRequest(
   ];
 
   try {
-    setOptNumber(libHandle.symbols, handle, CurlOption.NOPROGRESS, 1);
+    const abortSignal = options.abortSignal ?? null;
+    if (abortSignal) {
+      const abortState: AbortState = {
+        aborted: abortSignal.aborted,
+        reason: abortSignal.reason,
+      };
+      ctx.abortState = abortState;
+
+      if (abortState.aborted) {
+        throw toAbortError(abortState.reason);
+      }
+
+      const abortListener = () => {
+        abortState.aborted = true;
+        abortState.reason = abortSignal.reason;
+      };
+      abortSignal.addEventListener("abort", abortListener);
+      ctx.abortCleanup = () => {
+        abortSignal.removeEventListener("abort", abortListener);
+      };
+
+      const progressCallback = createProgressCallback(ctx);
+      if (!progressCallback.ptr || Number(progressCallback.ptr) === 0) {
+        throw new Error("Failed to create progress callback");
+      }
+      lifetimes.push(progressCallback);
+
+      setOptNumber(libHandle.symbols, handle, CurlOption.NOPROGRESS, 0);
+      const progressCode = setOptPointer(
+        libHandle.symbols,
+        handle,
+        CurlOption.XFERINFOFUNCTION,
+        progressCallback.ptr,
+      );
+      if (progressCode !== 0) {
+        throw new Error(
+          `curl_easy_setopt(CURLOPT_XFERINFOFUNCTION) failed with code ${progressCode}`,
+        );
+      }
+      const progressDataCode = setOptPointer(
+        libHandle.symbols,
+        handle,
+        CurlOption.XFERINFODATA,
+        0 as Pointer,
+      );
+      if (progressDataCode !== 0) {
+        throw new Error(
+          `curl_easy_setopt(CURLOPT_XFERINFODATA) failed with code ${progressDataCode}`,
+        );
+      }
+    } else {
+      setOptNumber(libHandle.symbols, handle, CurlOption.NOPROGRESS, 1);
+    }
     const acceptEncodingBuffer = setOptString(
       libHandle.symbols,
       handle,
@@ -727,10 +827,18 @@ export async function impersonatedRequest(
       }
     }
 
-    if (options.headers && Object.keys(options.headers).length > 0) {
+    const headerLines =
+      options.headerList ??
+      (options.headers && Object.keys(options.headers).length > 0
+        ? Object.entries(options.headers).map(
+            ([name, value]) => `${name}: ${value}`,
+          )
+        : undefined);
+
+    if (headerLines && headerLines.length > 0) {
       const headerList = new CurlSlist(libHandle.symbols);
-      for (const [name, value] of Object.entries(options.headers)) {
-        headerList.append(`${name}: ${value}`);
+      for (const line of headerLines) {
+        headerList.append(line);
       }
       const headerPtr = headerList.pointer;
       if (!headerPtr || Number(headerPtr) === 0) {
@@ -812,6 +920,12 @@ export async function impersonatedRequest(
     lifetimes.push(urlBuffer);
 
     const performCode = libHandle.symbols.curl_easy_perform(handle);
+    if (
+      performCode === CURLE_ABORTED_BY_CALLBACK &&
+      ctx.abortState?.aborted
+    ) {
+      throw toAbortError(ctx.abortState.reason);
+    }
     if (performCode !== 0) {
       throw new Error(
         `curl_easy_perform() failed with code ${performCode}: ${getCurlErrorString(performCode)}`,
@@ -870,8 +984,201 @@ export async function impersonatedRequest(
         lifetime.close();
       }
     }
+    ctx.abortCleanup?.();
   }
 }
+
+export async function fetchImpersonated(
+  input: string | URL | Request,
+  init: ImpersonatedFetchInit,
+): Promise<Response> {
+  if (!init || !init.target) {
+    throw new TypeError(
+      "fetchImpersonated requires a target impersonation profile in init.target",
+    );
+  }
+
+  const {
+    target,
+    defaultHeaders,
+    timeoutMs,
+    insecureSkipVerify,
+    loadOptions,
+    ...requestInit
+  } = init;
+
+  const request =
+    input instanceof Request
+      ? new Request(input, requestInit)
+      : new Request(
+          typeof input === "string" ? input : input.toString(),
+          requestInit,
+        );
+  const config = await buildFetchImpersonatedConfig(request, {
+    target,
+    defaultHeaders,
+    timeoutMs,
+    insecureSkipVerify,
+  });
+
+  const responseData = await impersonatedRequest(
+    config.options,
+    loadOptions,
+  );
+
+  return buildFetchResponse(responseData, config, request.url);
+}
+
+interface BuildFetchConfigInput {
+  target: CurlBrowserTarget;
+  defaultHeaders?: boolean;
+  timeoutMs?: number;
+  insecureSkipVerify?: boolean;
+}
+
+interface FetchImpersonatedConfig {
+  options: ImpersonatedRequestOptions;
+  redirectMode: RedirectMode;
+}
+
+type RedirectMode = "follow" | "manual" | "error";
+
+async function buildFetchImpersonatedConfig(
+  request: Request,
+  input: BuildFetchConfigInput,
+): Promise<FetchImpersonatedConfig> {
+  const redirectMode = (request.redirect ?? "follow") as RedirectMode;
+  const headerLines = buildHeaderLines(request.headers);
+
+  let bodyBytes: Uint8Array | undefined;
+  if (request.body !== null) {
+    const buffer = await request.arrayBuffer();
+    bodyBytes = new Uint8Array(buffer);
+  }
+
+  return {
+    redirectMode,
+    options: {
+      url: request.url,
+      target: input.target,
+      defaultHeaders: input.defaultHeaders,
+      headerList: headerLines,
+      method: request.method,
+      body: bodyBytes,
+      timeoutMs: input.timeoutMs,
+      followRedirects: redirectMode === "follow",
+      insecureSkipVerify: input.insecureSkipVerify,
+      abortSignal: request.signal,
+    },
+  };
+}
+
+function buildFetchResponse(
+  responseData: ImpersonatedResponse,
+  config: FetchImpersonatedConfig,
+  originalUrl: string,
+): Response {
+  const headers = buildHeadersFromLines(responseData.headers);
+  if (
+    config.redirectMode === "error" &&
+    isRedirectStatus(responseData.statusCode) &&
+    headers.has("location")
+  ) {
+    throw new TypeError("Redirect was blocked for this request.");
+  }
+
+  const redirected =
+    config.redirectMode === "follow" &&
+    normalizeUrl(responseData.effectiveUrl) !== normalizeUrl(originalUrl);
+
+  const response = new Response(responseData.body, {
+    status: responseData.statusCode,
+    headers,
+  });
+
+  applyResponseMetadata(response, responseData.effectiveUrl, redirected);
+
+  return response;
+}
+
+function buildHeaderLines(headers: Headers): string[] {
+  const lines: string[] = [];
+  headers.forEach((value, name) => {
+    lines.push(`${name}: ${value}`);
+  });
+  return lines;
+}
+
+function buildHeadersFromLines(lines: string[]): Headers {
+  const headers = new Headers();
+  for (const line of lines) {
+    const separator = line.indexOf(":");
+    if (separator <= 0) {
+      continue;
+    }
+    const name = line.slice(0, separator).trim();
+    const value = line.slice(separator + 1).trim();
+    if (name.length === 0) {
+      continue;
+    }
+    headers.append(name, value);
+  }
+  return headers;
+}
+
+function isRedirectStatus(status: number): boolean {
+  return status === 301 || status === 302 || status === 303 || status === 307 || status === 308;
+}
+
+function normalizeUrl(url: string): string {
+  try {
+    return new URL(url).toString();
+  } catch {
+    return url;
+  }
+}
+
+function applyResponseMetadata(
+  response: Response,
+  url: string,
+  redirected: boolean,
+) {
+  try {
+    Object.defineProperty(response, "url", {
+      value: url,
+      configurable: true,
+    });
+  } catch {
+    try {
+      (response as unknown as { url: string }).url = url;
+    } catch {
+      // ignore if we cannot set the URL metadata
+    }
+  }
+
+  try {
+    Object.defineProperty(response, "redirected", {
+      value: redirected,
+      configurable: true,
+    });
+  } catch {
+    try {
+      (response as unknown as { redirected: boolean }).redirected = redirected;
+    } catch {
+      // ignore if we cannot set the redirected flag
+    }
+  }
+}
+
+export const __bunpersonateInternals = {
+  buildHeaderLines,
+  buildHeadersFromLines,
+  isRedirectStatus,
+  normalizeUrl,
+  applyResponseMetadata,
+  buildFetchImpersonatedConfig,
+  buildFetchResponse,
+};
 
 function concatenateChunks(chunks: Uint8Array[]): Uint8Array {
   if (chunks.length === 0) {
@@ -891,6 +1198,24 @@ function concatenateChunks(chunks: Uint8Array[]): Uint8Array {
     offset += chunk.byteLength;
   }
   return buffer;
+}
+
+function toAbortError(reason?: unknown): Error {
+  if (reason instanceof Error) {
+    return reason;
+  }
+  if (typeof DOMException !== "undefined") {
+    const message =
+      typeof reason === "string" && reason.length > 0
+        ? reason
+        : "The operation was aborted.";
+    return new DOMException(message, "AbortError");
+  }
+  return new Error(
+    typeof reason === "string" && reason.length > 0
+      ? reason
+      : "The operation was aborted.",
+  );
 }
 
 /**
