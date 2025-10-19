@@ -19,7 +19,7 @@ Default to using Bun instead of Node.js.
   - `bun run test:all` (runs unit tests plus smoke test)
 - Keep this document current whenever workflows or scripts change.
 - Keep README.md current whenever workflows, scripts, or capabilities change.
-- Use Conventional Commits (`type: scope - message`) for the subject, and feel free to add a descriptive body (prose or bullet points) when the change warrants extra detail.
+- Use Conventional Commits (`type(scope): message`) for the subject, and feel free to add a descriptive body (prose or bullet points) when the change warrants extra detail.
 
 ## APIs
 
