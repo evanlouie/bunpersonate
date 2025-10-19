@@ -535,6 +535,7 @@ interface AbortState {
 interface PerformContext {
   responseChunks: Uint8Array[];
   headerLines: string[];
+  currentHeaderLines: string[];
   headerBuffer: string;
   headerDecoder: TextDecoder;
   abortState?: AbortState;
@@ -568,18 +569,7 @@ function createHeaderCallback(ctx: PerformContext) {
       }
       const chunk = new Uint8Array(toArrayBuffer(bufferPtr, 0, byteLength));
       ctx.headerBuffer += ctx.headerDecoder.decode(chunk, { stream: true });
-
-      let newlineIndex: number;
-      while ((newlineIndex = ctx.headerBuffer.indexOf("\r\n")) >= 0) {
-        const line = ctx.headerBuffer.slice(0, newlineIndex);
-        ctx.headerBuffer = ctx.headerBuffer.slice(newlineIndex + 2);
-        if (line.length > 0) {
-          ctx.headerLines.push(line);
-        } else {
-          ctx.headerLines.push("");
-        }
-      }
-
+      processHeaderBuffer(ctx);
       return byteLength;
     },
     {
@@ -610,6 +600,30 @@ function createProgressCallback(ctx: PerformContext) {
   );
 }
 
+function processHeaderBuffer(ctx: PerformContext, flush = false) {
+  let newlineIndex: number;
+  while ((newlineIndex = ctx.headerBuffer.indexOf("\r\n")) >= 0) {
+    const line = ctx.headerBuffer.slice(0, newlineIndex);
+    ctx.headerBuffer = ctx.headerBuffer.slice(newlineIndex + 2);
+    if (line.length > 0) {
+      ctx.currentHeaderLines.push(line);
+    } else if (ctx.currentHeaderLines.length > 0) {
+      ctx.headerLines = ctx.currentHeaderLines.slice();
+      ctx.currentHeaderLines.length = 0;
+    }
+  }
+  if (flush) {
+    if (ctx.headerBuffer.length > 0) {
+      ctx.currentHeaderLines.push(ctx.headerBuffer);
+      ctx.headerBuffer = "";
+    }
+    if (ctx.currentHeaderLines.length > 0) {
+      ctx.headerLines = ctx.currentHeaderLines.slice();
+      ctx.currentHeaderLines.length = 0;
+    }
+  }
+}
+
 /**
  * Perform an HTTP request with curl-impersonate, applying the selected browser profile
  * and wiring the response into Bun-friendly data structures.
@@ -633,6 +647,7 @@ export async function impersonatedRequest(
   const ctx: PerformContext = {
     responseChunks: [],
     headerLines: [],
+    currentHeaderLines: [],
     headerBuffer: "",
     headerDecoder: new TextDecoder(),
     abortCleanup: null,
@@ -773,17 +788,6 @@ export async function impersonatedRequest(
 
     if (method === "GET") {
       setOptNumber(libHandle.symbols, handle, CurlOption.HTTPGET, 1);
-    } else if (method === "POST") {
-      setOptNumber(libHandle.symbols, handle, CurlOption.UPLOAD, 0);
-    } else if (method === "PUT" || method === "PATCH") {
-      // libcurl expects UPLOAD=1 with a read callback, but we rely on POSTFIELDS for simplicity
-      const customBuffer = setOptString(
-        libHandle.symbols,
-        handle,
-        CurlOption.CUSTOMREQUEST,
-        method,
-      );
-      lifetimes.push(customBuffer);
     } else {
       const customBuffer = setOptString(
         libHandle.symbols,
@@ -792,6 +796,9 @@ export async function impersonatedRequest(
         method,
       );
       lifetimes.push(customBuffer);
+      if (method === "POST") {
+        setOptNumber(libHandle.symbols, handle, CurlOption.UPLOAD, 0);
+      }
     }
 
     if (options.body !== undefined) {
@@ -819,6 +826,31 @@ export async function impersonatedRequest(
         handle,
         CurlOption.POSTFIELDSIZE,
         BigInt(bodyLength),
+      );
+      if (sizeCode !== 0) {
+        throw new Error(
+          `curl_easy_setopt(CURLOPT_POSTFIELDSIZE) failed with code ${sizeCode}`,
+        );
+      }
+    } else if (method === "POST") {
+      const emptyValue = encodeCString("");
+      lifetimes.push(emptyValue.buffer);
+      const bodyCode = setOptPointer(
+        libHandle.symbols,
+        handle,
+        CurlOption.POSTFIELDS,
+        emptyValue.pointer,
+      );
+      if (bodyCode !== 0) {
+        throw new Error(
+          `curl_easy_setopt(CURLOPT_POSTFIELDS) failed with code ${bodyCode}`,
+        );
+      }
+      const sizeCode = setOptLong(
+        libHandle.symbols,
+        handle,
+        CurlOption.POSTFIELDSIZE,
+        0n,
       );
       if (sizeCode !== 0) {
         throw new Error(
@@ -934,6 +966,7 @@ export async function impersonatedRequest(
 
     // Flush any buffered decoder state in case the final header chunk didn't terminate properly.
     ctx.headerBuffer += ctx.headerDecoder.decode();
+    processHeaderBuffer(ctx, true);
 
     const responseCodeArray = new BigInt64Array(1);
     const infoCode = getInfoLong(
