@@ -38,6 +38,12 @@ console.log(await response.text());
 
 `fetchImpersonated` mirrors the WHATWG Fetch API: it accepts any `RequestInfo` + `RequestInit`, honors `redirect`, `signal`, and standard body types, and returns a real `Response` with `Headers` support. The only required extension is `init.target`, which selects the curl-impersonate browser profile.
 
+### Streaming responses & uploads
+
+- `fetchImpersonated` streams response bodies by default. Opt into buffering by setting `responseType: "buffer"` if you need the legacy behavior.
+- The low-level `impersonatedRequest` API accepts the full `BodyInit` union (strings, `Blob`, `URLSearchParams`, `FormData`, typed arrays, and `ReadableStream`). Appropriate `Content-Type` headers are inferred when possible—override them via `headers` or `headerList` as needed.
+- For cancellation, prefer `AbortSignal.timeout()` or a shared `AbortController`—`timeoutMs` now cooperates with signals and is implemented as a convenience wrapper.
+
 ## Low-level helper
 
 `impersonatedRequest` remains available when you want direct access to the raw buffers or need to integrate with the underlying FFI primitives.
@@ -69,6 +75,9 @@ try {
   unloadCurlLibrary();
 }
 ```
+
+- The response payload defaults to a buffered `Uint8Array`. Set `responseType: "stream"` to receive a `ReadableStream<Uint8Array>` via the `bodyStream` property alongside the buffered view.
+- Headers can be provided as `HeadersInit` or preformatted strings. When a `BodyInit` implies a `Content-Type`, it is appended automatically unless you override it.
 
 ## Tests
 

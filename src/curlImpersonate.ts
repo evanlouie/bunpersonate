@@ -64,7 +64,7 @@ export interface ImpersonatedRequestOptions {
   /**
    * Extra HTTP headers to attach (sorted as provided).
    */
-  headers?: Record<string, string>;
+  headers?: HeadersInit;
   /**
    * Preformatted HTTP header lines. When provided, takes precedence over `headers`.
    */
@@ -77,7 +77,7 @@ export interface ImpersonatedRequestOptions {
    * Request body. Treated as binary data; caller must set a matching
    * Content-Type header when needed.
    */
-  body?: Uint8Array | string;
+  body?: BodyInit | null;
   /**
    * Abort after the given number of milliseconds.
    */
@@ -94,6 +94,10 @@ export interface ImpersonatedRequestOptions {
    * Abort signal compatible with WHATWG Fetch APIs.
    */
   abortSignal?: AbortSignal | null;
+  /**
+   * Controls how the response body is exposed. Defaults to "buffer" for backwards compatibility.
+   */
+  responseType?: "buffer" | "stream";
 }
 
 export interface ImpersonatedFetchInit extends RequestInit {
@@ -102,6 +106,7 @@ export interface ImpersonatedFetchInit extends RequestInit {
   timeoutMs?: number;
   insecureSkipVerify?: boolean;
   loadOptions?: LoadCurlImpersonateOptions;
+  responseType?: "buffer" | "stream";
 }
 
 /**
@@ -111,6 +116,7 @@ export interface ImpersonatedResponse {
   statusCode: number;
   headers: string[];
   body: Uint8Array;
+  bodyStream?: ReadableStream<Uint8Array>;
   effectiveUrl: string;
 }
 
@@ -567,6 +573,10 @@ interface PerformContext {
   headerDecoder: TextDecoder;
   abortState?: AbortState;
   abortCleanup?: (() => void) | null;
+  responseMode: "buffer" | "stream";
+  responseStream?: ReadableStream<Uint8Array> | null;
+  responseStreamController?: ReadableStreamDefaultController<Uint8Array> | null;
+  streamCancelled?: boolean;
 }
 
 function createWriteCallback(ctx: PerformContext) {
@@ -576,8 +586,15 @@ function createWriteCallback(ctx: PerformContext) {
       if (byteLength === 0) {
         return 0;
       }
+      if (ctx.responseMode === "stream" && ctx.streamCancelled) {
+        return 0;
+      }
       const chunk = new Uint8Array(toArrayBuffer(bufferPtr, 0, byteLength));
-      ctx.responseChunks.push(chunk);
+      if (ctx.responseMode === "stream" && ctx.responseStreamController) {
+        ctx.responseStreamController.enqueue(chunk);
+      } else {
+        ctx.responseChunks.push(chunk);
+      }
       return byteLength;
     },
     {
@@ -651,6 +668,191 @@ function processHeaderBuffer(ctx: PerformContext, flush = false) {
   }
 }
 
+function initializeResponseStream(
+  ctx: PerformContext,
+): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      ctx.responseStreamController = controller;
+    },
+    cancel(reason) {
+      ctx.streamCancelled = true;
+      if (!ctx.abortState) {
+        ctx.abortState = { aborted: true, reason };
+      } else {
+        ctx.abortState.aborted = true;
+        ctx.abortState.reason = reason;
+      }
+    },
+  });
+}
+
+function setupAbortSignal(
+  signal: AbortSignal | null,
+  timeoutMs?: number,
+): { signal: AbortSignal | null; cleanup: (() => void) | null } {
+  let timeoutCleanup: (() => void) | null = null;
+
+  if (typeof timeoutMs !== "number" || timeoutMs <= 0) {
+    return { signal, cleanup: null };
+  }
+
+  const timeoutController = new AbortController();
+  const timeoutId: ReturnType<typeof setTimeout> = setTimeout(() => {
+    const reason =
+      typeof DOMException !== "undefined"
+        ? new DOMException(
+            `The operation timed out after ${timeoutMs}ms.`,
+            "TimeoutError",
+          )
+        : new Error(`The operation timed out after ${timeoutMs}ms.`);
+    timeoutController.abort(reason);
+  }, timeoutMs);
+
+  const possibleTimer = timeoutId as unknown as {
+    unref?: () => void;
+  };
+  if (possibleTimer && typeof possibleTimer.unref === "function") {
+    possibleTimer.unref();
+  }
+
+  timeoutCleanup = () => {
+    clearTimeout(timeoutId);
+  };
+
+  if (!signal) {
+    return {
+      signal: timeoutController.signal,
+      cleanup: () => {
+        timeoutCleanup?.();
+      },
+    };
+  }
+
+  if (signal.aborted) {
+    timeoutController.abort(signal.reason);
+    timeoutCleanup();
+    return { signal, cleanup: null };
+  }
+
+  const composite = new AbortController();
+  const handleSignalAbort = () => {
+    composite.abort(signal.reason);
+  };
+  const handleTimeoutAbort = () => {
+    composite.abort(timeoutController.signal.reason);
+  };
+
+  signal.addEventListener("abort", handleSignalAbort);
+  timeoutController.signal.addEventListener("abort", handleTimeoutAbort);
+
+  return {
+    signal: composite.signal,
+    cleanup: () => {
+      timeoutCleanup?.();
+      signal.removeEventListener("abort", handleSignalAbort);
+      timeoutController.signal.removeEventListener("abort", handleTimeoutAbort);
+    },
+  };
+}
+
+interface NormalizedRequestBody {
+  bytes: Uint8Array | null;
+  impliedContentType?: string;
+}
+
+async function normalizeRequestBody(
+  body: BodyInit | null,
+  method: string,
+): Promise<NormalizedRequestBody> {
+  if (body === null || typeof body === "undefined") {
+    return { bytes: null };
+  }
+
+  if (body instanceof Uint8Array) {
+    return { bytes: body };
+  }
+
+  if (ArrayBuffer.isView(body)) {
+    const view = body as ArrayBufferView;
+    return {
+      bytes: new Uint8Array(view.buffer, view.byteOffset, view.byteLength),
+    };
+  }
+
+  if (body instanceof ArrayBuffer) {
+    return { bytes: new Uint8Array(body) };
+  }
+
+  if (typeof Blob !== "undefined" && body instanceof Blob) {
+    const buffer = await body.arrayBuffer();
+    const contentType = body.type || undefined;
+    return {
+      bytes: new Uint8Array(buffer),
+      impliedContentType: contentType,
+    };
+  }
+
+  const requestMethod =
+    method === "GET" || method === "HEAD" ? "POST" : method || "POST";
+  const request = new Request("https://bunpersonate.local/body", {
+    method: requestMethod,
+    body,
+  });
+  const contentType = request.headers.get("content-type") ?? undefined;
+  const arrayBuffer = await request.arrayBuffer();
+  return {
+    bytes: new Uint8Array(arrayBuffer),
+    impliedContentType: contentType || undefined,
+  };
+}
+
+function buildRequestHeaderLines(
+  headerList: string[] | undefined,
+  headersInit: HeadersInit | undefined,
+  impliedContentType?: string,
+): string[] {
+  if (headerList && headerList.length > 0) {
+    const lines = headerList.map((line) => {
+      assertValidHeaderLine(line);
+      return line;
+    });
+    return appendContentType(lines, impliedContentType);
+  }
+
+  if (!headersInit) {
+    return appendContentType([], impliedContentType);
+  }
+
+  const headers =
+    headersInit instanceof Headers ? headersInit : new Headers(headersInit);
+  const lines: string[] = [];
+  for (const [name, value] of headers.entries()) {
+    assertValidHeaderName(name);
+    assertValidHeaderValue(value);
+    lines.push(`${name}: ${value}`);
+  }
+  return appendContentType(lines, impliedContentType);
+}
+
+function appendContentType(
+  lines: string[],
+  impliedContentType?: string,
+): string[] {
+  if (!impliedContentType) {
+    return lines;
+  }
+  const hasContentType = lines.some((line) =>
+    line.toLowerCase().startsWith("content-type:"),
+  );
+  if (hasContentType) {
+    return lines;
+  }
+  assertValidHeaderName("Content-Type");
+  assertValidHeaderValue(impliedContentType);
+  return [...lines, `Content-Type: ${impliedContentType}`];
+}
+
 /**
  * Perform an HTTP request with curl-impersonate, applying the selected browser profile
  * and wiring the response into Bun-friendly data structures.
@@ -671,6 +873,8 @@ export async function impersonatedRequest(
   }
   const handle = rawHandle as Pointer;
 
+  const responseMode = options.responseType === "stream" ? "stream" : "buffer";
+
   const ctx: PerformContext = {
     responseChunks: [],
     headerLines: [],
@@ -678,7 +882,15 @@ export async function impersonatedRequest(
     headerBuffer: "",
     headerDecoder: new TextDecoder(),
     abortCleanup: null,
+    responseMode,
+    responseStream: null,
+    responseStreamController: null,
+    streamCancelled: false,
   };
+
+  if (responseMode === "stream") {
+    ctx.responseStream = initializeResponseStream(ctx);
+  }
 
   const writeCallback = createWriteCallback(ctx);
   const headerCallback = createHeaderCallback(ctx);
@@ -689,7 +901,13 @@ export async function impersonatedRequest(
   ];
 
   try {
-    const abortSignal = options.abortSignal ?? null;
+    const cleanupHandlers: Array<() => void> = [];
+    const abortSetup = setupAbortSignal(options.abortSignal ?? null, options.timeoutMs);
+    const abortSignal = abortSetup.signal;
+    if (abortSetup.cleanup) {
+      cleanupHandlers.push(abortSetup.cleanup);
+    }
+
     if (abortSignal) {
       const abortState: AbortState = {
         aborted: abortSignal.aborted,
@@ -706,9 +924,9 @@ export async function impersonatedRequest(
         abortState.reason = abortSignal.reason;
       };
       abortSignal.addEventListener("abort", abortListener);
-      ctx.abortCleanup = () => {
+      cleanupHandlers.push(() => {
         abortSignal.removeEventListener("abort", abortListener);
-      };
+      });
 
       const progressCallback = createProgressCallback(ctx);
       if (!progressCallback.ptr || Number(progressCallback.ptr) === 0) {
@@ -742,6 +960,16 @@ export async function impersonatedRequest(
     } else {
       setOptNumber(libHandle.symbols, handle, CurlOption.NOPROGRESS, 1);
     }
+
+    ctx.abortCleanup = () => {
+      for (const cleanup of cleanupHandlers) {
+        try {
+          cleanup();
+        } catch {
+          // ignore cleanup errors
+        }
+      }
+    };
     const acceptEncodingBuffer = setOptString(
       libHandle.symbols,
       handle,
@@ -802,6 +1030,10 @@ export async function impersonatedRequest(
     }
 
     const method = options.method?.toUpperCase() ?? "GET";
+    const normalizedBody = await normalizeRequestBody(
+      options.body ?? null,
+      method,
+    );
 
     if (!options.insecureSkipVerify) {
       setOptNumber(
@@ -828,11 +1060,8 @@ export async function impersonatedRequest(
       }
     }
 
-    if (options.body !== undefined) {
-      const bodyBytes =
-        typeof options.body === "string"
-          ? utf8Encoder.encode(options.body)
-          : options.body;
+    if (normalizedBody.bytes) {
+      const bodyBytes = normalizedBody.bytes;
       lifetimes.push(bodyBytes);
       const bodyPtr = ptr(bodyBytes);
       const bodyLength = bodyBytes.byteLength;
@@ -886,25 +1115,13 @@ export async function impersonatedRequest(
       }
     }
 
-    let headerLines: string[] | undefined;
-    if (options.headerList) {
-      headerLines = options.headerList.map((line) => {
-        assertValidHeaderLine(line);
-        return line;
-      });
-    } else if (options.headers) {
-      const entries = Object.entries(options.headers);
-      if (entries.length > 0) {
-        headerLines = entries.map(([name, value]) => {
-          assertValidHeaderName(name);
-          assertValidHeaderValue(value);
-          const normalizedName = name.trim();
-          return `${normalizedName}: ${value}`;
-        });
-      }
-    }
+    const headerLines = buildRequestHeaderLines(
+      options.headerList,
+      options.headers,
+      normalizedBody.impliedContentType,
+    );
 
-    if (headerLines && headerLines.length > 0) {
+    if (headerLines.length > 0) {
       const headerList = new CurlSlist(libHandle.symbols);
       for (const line of headerLines) {
         headerList.append(line);
@@ -1028,7 +1245,10 @@ export async function impersonatedRequest(
       );
     }
 
-    const body: Uint8Array = concatenateChunks(ctx.responseChunks);
+    const body: Uint8Array =
+      ctx.responseMode === "stream"
+        ? new Uint8Array()
+        : concatenateChunks(ctx.responseChunks);
     const statusCode = Number(responseCodeArray[0]);
     const effectiveUrlPtr = Number(effectiveUrlPtrArray[0]);
     const effectiveUrl =
@@ -1036,12 +1256,26 @@ export async function impersonatedRequest(
         ? new CString(effectiveUrlPtr as unknown as Pointer).toString()
         : options.url;
 
+    if (ctx.responseStreamController && !ctx.streamCancelled) {
+      ctx.responseStreamController.close();
+    }
+
     return {
       statusCode,
       headers: ctx.headerLines.filter((line) => line.length > 0),
       body,
+      bodyStream: ctx.responseStream ?? undefined,
       effectiveUrl,
     };
+  } catch (error) {
+    if (ctx.responseStreamController && !ctx.streamCancelled) {
+      try {
+        ctx.responseStreamController.error(error);
+      } catch {
+        // ignore controller errors during teardown
+      }
+    }
+    throw error;
   } finally {
     libHandle.symbols.curl_easy_cleanup(handle);
     for (const lifetime of lifetimes) {
@@ -1071,6 +1305,7 @@ export async function fetchImpersonated(
     timeoutMs,
     insecureSkipVerify,
     loadOptions,
+    responseType,
     ...requestInit
   } = init;
 
@@ -1086,6 +1321,7 @@ export async function fetchImpersonated(
     defaultHeaders,
     timeoutMs,
     insecureSkipVerify,
+    responseType,
   });
 
   const responseData = await impersonatedRequest(config.options, loadOptions);
@@ -1098,6 +1334,7 @@ interface BuildFetchConfigInput {
   defaultHeaders?: boolean;
   timeoutMs?: number;
   insecureSkipVerify?: boolean;
+  responseType?: "buffer" | "stream";
 }
 
 interface FetchImpersonatedConfig {
@@ -1133,6 +1370,7 @@ async function buildFetchImpersonatedConfig(
       followRedirects: redirectMode === "follow",
       insecureSkipVerify: input.insecureSkipVerify,
       abortSignal: request.signal,
+      responseType: input.responseType ?? "stream",
     },
   };
 }
@@ -1155,15 +1393,22 @@ function buildFetchResponse(
     config.redirectMode === "follow" &&
     normalizeUrl(responseData.effectiveUrl) !== normalizeUrl(originalUrl);
 
-  const responseBuffer =
-    responseData.body.byteOffset === 0 &&
-    responseData.body.byteLength === responseData.body.buffer.byteLength
-      ? (responseData.body.buffer as ArrayBuffer)
-      : (responseData.body.buffer.slice(
-          responseData.body.byteOffset,
-          responseData.body.byteOffset + responseData.body.byteLength,
-        ) as ArrayBuffer);
-  const response = new Response(responseBuffer, {
+  let responseBody: BodyInit | null;
+  if (responseData.bodyStream) {
+    responseBody = responseData.bodyStream;
+  } else {
+    const responseBuffer =
+      responseData.body.byteOffset === 0 &&
+      responseData.body.byteLength === responseData.body.buffer.byteLength
+        ? (responseData.body.buffer as ArrayBuffer)
+        : (responseData.body.buffer.slice(
+            responseData.body.byteOffset,
+            responseData.body.byteOffset + responseData.body.byteLength,
+          ) as ArrayBuffer);
+    responseBody = responseBuffer;
+  }
+
+  const response = new Response(responseBody, {
     status: responseData.statusCode,
     headers,
   });
@@ -1256,6 +1501,8 @@ export const __bunpersonateInternals = {
   applyResponseMetadata,
   buildFetchImpersonatedConfig,
   buildFetchResponse,
+  normalizeRequestBody,
+  buildRequestHeaderLines,
 };
 
 function concatenateChunks(chunks: Uint8Array[]): Uint8Array {

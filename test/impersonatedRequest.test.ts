@@ -14,6 +14,8 @@ const {
   applyResponseMetadata,
   buildFetchImpersonatedConfig,
   buildFetchResponse,
+  normalizeRequestBody,
+  buildRequestHeaderLines,
 } = __bunpersonateInternals;
 
 type FetchConfig = Awaited<ReturnType<typeof buildFetchImpersonatedConfig>>;
@@ -80,6 +82,16 @@ test("buildFetchImpersonatedConfig maps request settings", async () => {
   expect(config.options.method).toBe("POST");
   expect(config.options.body).toBeInstanceOf(Uint8Array);
   expect(config.options.headerList).toContain("content-type: application/json");
+  expect(config.options.responseType).toBe("stream");
+});
+
+test("buildFetchImpersonatedConfig honors responseType override", async () => {
+  const request = new Request("https://example.com/bodyless");
+  const config = await buildFetchImpersonatedConfig(request, {
+    target: "chrome124",
+    responseType: "buffer",
+  });
+  expect(config.options.responseType).toBe("buffer");
 });
 
 test("buildFetchImpersonatedConfig propagates abort signal", async () => {
@@ -153,6 +165,79 @@ test("buildFetchResponse marks redirected responses", () => {
 
   expect(response.redirected).toBe(true);
   expect(response.url).toBe("https://example.com/final");
+});
+
+test("buildFetchResponse streams body when provided", async () => {
+  const config: FetchConfig = {
+    redirectMode: "follow",
+    options: {
+      url: "https://example.com/start",
+      target: "chrome124",
+      method: "GET",
+      headerList: [],
+      followRedirects: true,
+      insecureSkipVerify: undefined,
+      timeoutMs: undefined,
+      defaultHeaders: undefined,
+      abortSignal: undefined,
+      body: undefined,
+      responseType: "stream",
+    },
+  };
+
+  const chunk = new TextEncoder().encode("streamed");
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(chunk);
+      controller.close();
+    },
+  });
+
+  const responseData = {
+    statusCode: 200,
+    headers: ["content-type: text/plain"],
+    body: new Uint8Array(),
+    bodyStream: stream,
+    effectiveUrl: "https://example.com/final",
+  } satisfies Parameters<typeof buildFetchResponse>[0];
+
+  const response = buildFetchResponse(responseData, config, config.options.url);
+  expect(await response.text()).toBe("streamed");
+});
+
+test("normalizeRequestBody handles FormData payloads", async () => {
+  const form = new FormData();
+  form.append("field", "value");
+  form.append("file", new Blob(["hello"], { type: "text/plain" }), "demo.txt");
+
+  const normalized = await normalizeRequestBody(form, "POST");
+  expect(normalized.bytes).toBeInstanceOf(Uint8Array);
+  expect(normalized.bytes?.byteLength).toBeGreaterThan(0);
+  expect(normalized.impliedContentType?.startsWith("multipart/form-data")).toBe(
+    true,
+  );
+});
+
+test("buildRequestHeaderLines adds implied content-type when missing", () => {
+  const lines = buildRequestHeaderLines(
+    undefined,
+    { "x-test": "1" },
+    "text/plain",
+  );
+  expect(lines).toContain("Content-Type: text/plain");
+});
+
+test("buildRequestHeaderLines respects existing content-type", () => {
+  const lines = buildRequestHeaderLines(
+    ["Content-Type: application/json"],
+    undefined,
+    "text/plain",
+  );
+  const matches = lines.filter((line) =>
+    line.toLowerCase().startsWith("content-type:"),
+  );
+  expect(matches.length).toBe(1);
+  expect(matches[0]).toBe("Content-Type: application/json");
 });
 
 let libraryAvailable = false;
