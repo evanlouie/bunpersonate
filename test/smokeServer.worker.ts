@@ -1,3 +1,7 @@
+/// <reference lib="webworker" />
+
+declare const self: DedicatedWorkerGlobalScope;
+
 const server = Bun.serve({
   hostname: "127.0.0.1",
   port: 0,
@@ -50,6 +54,6 @@ addEventListener("message", (event) => {
   if (event.data === "close") {
     server.stop(true);
     postMessage({ type: "closed" });
-    close();
+    self.close();
   }
 });

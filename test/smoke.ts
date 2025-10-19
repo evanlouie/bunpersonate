@@ -17,8 +17,12 @@ async function main() {
   const results: SmokeResult[] = [];
 
   try {
-    results.push(await runWithTimeout("legacy-basic-get", () => basicGetLegacy(baseUrl)));
-    results.push(await runWithTimeout("fetch-basic-get", () => basicGetFetch(baseUrl)));
+    results.push(
+      await runWithTimeout("legacy-basic-get", () => basicGetLegacy(baseUrl)),
+    );
+    results.push(
+      await runWithTimeout("fetch-basic-get", () => basicGetFetch(baseUrl)),
+    );
     results.push(
       await runWithTimeout("legacy-redirect-follow", () =>
         redirectFollowLegacy(baseUrl),
@@ -39,18 +43,32 @@ async function main() {
         redirectErrorFetch(baseUrl),
       ),
     );
-    results.push(await runWithTimeout("legacy-post-echo", () => postEchoLegacy(baseUrl)));
-    results.push(await runWithTimeout("fetch-post-echo", () => postEchoFetch(baseUrl)));
     results.push(
-      await runWithTimeout("legacy-post-no-body", () => postNoBodyLegacy(baseUrl)),
+      await runWithTimeout("legacy-post-echo", () => postEchoLegacy(baseUrl)),
     );
     results.push(
-      await runWithTimeout("fetch-post-no-body", () => postNoBodyFetch(baseUrl)),
+      await runWithTimeout("fetch-post-echo", () => postEchoFetch(baseUrl)),
     );
-    results.push(await runWithTimeout("legacy-timeout", () => timeoutLegacy(baseUrl)));
-    results.push(await runWithTimeout("fetch-abort", () => abortFetch(baseUrl)));
     results.push(
-      await runWithTimeout("fetch-alt-target", () => alternateTargetFetch(baseUrl)),
+      await runWithTimeout("legacy-post-no-body", () =>
+        postNoBodyLegacy(baseUrl),
+      ),
+    );
+    results.push(
+      await runWithTimeout("fetch-post-no-body", () =>
+        postNoBodyFetch(baseUrl),
+      ),
+    );
+    results.push(
+      await runWithTimeout("legacy-timeout", () => timeoutLegacy(baseUrl)),
+    );
+    results.push(
+      await runWithTimeout("fetch-abort", () => abortFetch(baseUrl)),
+    );
+    results.push(
+      await runWithTimeout("fetch-alt-target", () =>
+        alternateTargetFetch(baseUrl),
+      ),
     );
 
     const failed = results.filter((result) => !result.success);
@@ -59,20 +77,29 @@ async function main() {
       throw new Error(`Smoke tests failed:\n${details}`);
     }
 
-    console.log("Smoke suite passed", results.map((result) => result.name));
+    console.log(
+      "Smoke suite passed",
+      results.map((result) => result.name),
+    );
   } finally {
     await stopSmokeServer(worker);
     unloadCurlLibrary();
   }
 }
 
-async function startSmokeServer(): Promise<{ worker: Worker; baseUrl: string }> {
+async function startSmokeServer(): Promise<{
+  worker: Worker;
+  baseUrl: string;
+}> {
   const worker = new Worker(
     new URL("./smokeServer.worker.ts", import.meta.url).href,
     { type: "module" },
   );
   const baseUrl = await new Promise<string>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("Smoke server failed to start")), 1_000);
+    const timer = setTimeout(
+      () => reject(new Error("Smoke server failed to start")),
+      1_000,
+    );
     worker.addEventListener("message", function handle(event) {
       const data = event.data as { type: string; port?: number };
       if (data?.type === "ready" && typeof data.port === "number") {
@@ -148,10 +175,15 @@ async function redirectFollowLegacy(baseUrl: string): Promise<SmokeResult> {
     });
     ensure(response.statusCode === 200, "legacy redirect final status");
     ensure(
-      !response.headers.some((line) => line.toLowerCase().startsWith("location:")),
+      !response.headers.some((line) =>
+        line.toLowerCase().startsWith("location:"),
+      ),
       "legacy redirect headers should not include intermediate location",
     );
-    ensure(new TextDecoder().decode(response.body) === "redirected", "legacy redirect body");
+    ensure(
+      new TextDecoder().decode(response.body) === "redirected",
+      "legacy redirect body",
+    );
     return { name: "legacy-redirect-follow", success: true };
   } catch (error) {
     console.error("legacy-redirect-follow failed", error);
@@ -169,7 +201,10 @@ async function redirectFollowFetch(baseUrl: string): Promise<SmokeResult> {
     });
     ensure(response.status === 200, "fetch follow status");
     ensure(response.redirected === true, "fetch follow redirected flag");
-    ensure(response.headers.get("location") === null, "fetch follow location header cleared");
+    ensure(
+      response.headers.get("location") === null,
+      "fetch follow location header cleared",
+    );
     ensure((await response.text()) === "redirected", "fetch follow body");
     return { name: "fetch-redirect-follow", success: true };
   } catch (error) {
@@ -187,7 +222,10 @@ async function redirectManualFetch(baseUrl: string): Promise<SmokeResult> {
       insecureSkipVerify: true,
     });
     ensure(response.status === 302, "manual redirect status");
-    ensure(response.headers.get("location") === `${baseUrl}/redirect-final`, "manual redirect location");
+    ensure(
+      response.headers.get("location") === `${baseUrl}/redirect-final`,
+      "manual redirect location",
+    );
     ensure(response.redirected === false, "manual redirect flag");
     return { name: "fetch-redirect-manual", success: true };
   } catch (error) {
@@ -235,7 +273,10 @@ async function postEchoLegacy(baseUrl: string): Promise<SmokeResult> {
     const parsed = JSON.parse(new TextDecoder().decode(response.body));
     ensure(parsed.body === payload, "legacy POST body echo");
     ensure(parsed.method === "POST", "legacy POST method");
-    ensure(parsed.headers["content-type"] === "application/json", "legacy POST header");
+    ensure(
+      parsed.headers["content-type"] === "application/json",
+      "legacy POST header",
+    );
     return { name: "legacy-post-echo", success: true };
   } catch (error) {
     console.error("legacy-post-echo failed", error);
@@ -260,7 +301,10 @@ async function postEchoFetch(baseUrl: string): Promise<SmokeResult> {
     const json = (await response.json()) as any;
     ensure(json.body === payload, "fetch POST body");
     ensure(json.method === "POST", "fetch POST method");
-    ensure(json.headers["content-type"] === "application/json", "fetch header propagation");
+    ensure(
+      json.headers["content-type"] === "application/json",
+      "fetch header propagation",
+    );
     return { name: "fetch-post-echo", success: true };
   } catch (error) {
     console.error("fetch-post-echo failed", error);
@@ -326,7 +370,8 @@ async function timeoutLegacy(baseUrl: string): Promise<SmokeResult> {
         insecureSkipVerify: true,
       });
     } catch (error) {
-      timedOut = error instanceof Error && /timed out|timeout/i.test(error.message);
+      timedOut =
+        error instanceof Error && /timed out|timeout/i.test(error.message);
     }
     ensure(timedOut, "legacy timeout should throw");
     return { name: "legacy-timeout", success: true };
@@ -388,7 +433,7 @@ async function runWithTimeout(
   task: () => Promise<SmokeResult>,
   timeoutMs = TEST_TIMEOUT_MS,
 ): Promise<SmokeResult> {
-  let timer: number | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   const timeoutPromise = new Promise<SmokeResult>((resolve) => {
     timer = setTimeout(() => {
       console.error(`${name} timed out after ${timeoutMs}ms`);

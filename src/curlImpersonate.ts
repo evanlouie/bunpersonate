@@ -223,6 +223,33 @@ const LIBRARY_EXTENSIONS =
 
 const utf8Encoder = new TextEncoder();
 
+const HTTP_HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+
+function assertValidHeaderName(name: string) {
+  const trimmed = name.trim();
+  if (trimmed.length === 0 || !HTTP_HEADER_NAME_RE.test(trimmed)) {
+    throw new TypeError(
+      `Invalid HTTP header name "${name}". Header names must be RFC 7230 tokens.`,
+    );
+  }
+}
+
+function assertValidHeaderValue(value: string) {
+  if (value.includes("\r") || value.includes("\n")) {
+    throw new TypeError(
+      "HTTP header values must not contain CR (\\r) or LF (\\n) characters.",
+    );
+  }
+}
+
+function assertValidHeaderLine(line: string) {
+  if (line.includes("\r") || line.includes("\n")) {
+    throw new TypeError(
+      "HTTP header lines must not contain CR (\\r) or LF (\\n) characters.",
+    );
+  }
+}
+
 function encodeCString(value: string): {
   buffer: Uint8Array;
   pointer: Pointer;
@@ -859,13 +886,23 @@ export async function impersonatedRequest(
       }
     }
 
-    const headerLines =
-      options.headerList ??
-      (options.headers && Object.keys(options.headers).length > 0
-        ? Object.entries(options.headers).map(
-            ([name, value]) => `${name}: ${value}`,
-          )
-        : undefined);
+    let headerLines: string[] | undefined;
+    if (options.headerList) {
+      headerLines = options.headerList.map((line) => {
+        assertValidHeaderLine(line);
+        return line;
+      });
+    } else if (options.headers) {
+      const entries = Object.entries(options.headers);
+      if (entries.length > 0) {
+        headerLines = entries.map(([name, value]) => {
+          assertValidHeaderName(name);
+          assertValidHeaderValue(value);
+          const normalizedName = name.trim();
+          return `${normalizedName}: ${value}`;
+        });
+      }
+    }
 
     if (headerLines && headerLines.length > 0) {
       const headerList = new CurlSlist(libHandle.symbols);
@@ -952,10 +989,7 @@ export async function impersonatedRequest(
     lifetimes.push(urlBuffer);
 
     const performCode = libHandle.symbols.curl_easy_perform(handle);
-    if (
-      performCode === CURLE_ABORTED_BY_CALLBACK &&
-      ctx.abortState?.aborted
-    ) {
+    if (performCode === CURLE_ABORTED_BY_CALLBACK && ctx.abortState?.aborted) {
       throw toAbortError(ctx.abortState.reason);
     }
     if (performCode !== 0) {
@@ -1054,10 +1088,7 @@ export async function fetchImpersonated(
     insecureSkipVerify,
   });
 
-  const responseData = await impersonatedRequest(
-    config.options,
-    loadOptions,
-  );
+  const responseData = await impersonatedRequest(config.options, loadOptions);
 
   return buildFetchResponse(responseData, config, request.url);
 }
@@ -1124,7 +1155,15 @@ function buildFetchResponse(
     config.redirectMode === "follow" &&
     normalizeUrl(responseData.effectiveUrl) !== normalizeUrl(originalUrl);
 
-  const response = new Response(responseData.body, {
+  const responseBuffer =
+    responseData.body.byteOffset === 0 &&
+    responseData.body.byteLength === responseData.body.buffer.byteLength
+      ? (responseData.body.buffer as ArrayBuffer)
+      : (responseData.body.buffer.slice(
+          responseData.body.byteOffset,
+          responseData.body.byteOffset + responseData.body.byteLength,
+        ) as ArrayBuffer);
+  const response = new Response(responseBuffer, {
     status: responseData.statusCode,
     headers,
   });
@@ -1160,7 +1199,13 @@ function buildHeadersFromLines(lines: string[]): Headers {
 }
 
 function isRedirectStatus(status: number): boolean {
-  return status === 301 || status === 302 || status === 303 || status === 307 || status === 308;
+  return (
+    status === 301 ||
+    status === 302 ||
+    status === 303 ||
+    status === 307 ||
+    status === 308
+  );
 }
 
 function normalizeUrl(url: string): string {

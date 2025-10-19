@@ -120,9 +120,9 @@ test("buildFetchResponse throws when redirect policy is error", () => {
     effectiveUrl: "https://example.com/final",
   } satisfies Parameters<typeof buildFetchResponse>[0];
 
-  expect(() => buildFetchResponse(responseData, config, config.options.url)).toThrow(
-    /Redirect was blocked/i,
-  );
+  expect(() =>
+    buildFetchResponse(responseData, config, config.options.url),
+  ).toThrow(/Redirect was blocked/i);
 });
 
 test("buildFetchResponse marks redirected responses", () => {
@@ -149,11 +149,7 @@ test("buildFetchResponse marks redirected responses", () => {
     effectiveUrl: "https://example.com/final",
   } satisfies Parameters<typeof buildFetchResponse>[0];
 
-  const response = buildFetchResponse(
-    responseData,
-    config,
-    config.options.url,
-  );
+  const response = buildFetchResponse(responseData, config, config.options.url);
 
   expect(response.redirected).toBe(true);
   expect(response.url).toBe("https://example.com/final");
