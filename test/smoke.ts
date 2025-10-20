@@ -70,6 +70,11 @@ async function main() {
         alternateTargetFetch(baseUrl),
       ),
     );
+    results.push(
+      await runWithTimeout("concurrent-requests", () =>
+        concurrentRequests(baseUrl),
+      ),
+    );
 
     const failed = results.filter((result) => !result.success);
     if (failed.length > 0) {
@@ -420,6 +425,38 @@ async function alternateTargetFetch(baseUrl: string): Promise<SmokeResult> {
     }
   }
   return { name: "fetch-alt-target", success: false };
+}
+
+async function concurrentRequests(baseUrl: string): Promise<SmokeResult> {
+  try {
+    const promises = Array.from({ length: 5 }, (_, i) =>
+      fetchImpersonated(`${baseUrl}/ok`, {
+        target: DEFAULT_TARGET,
+        timeoutMs: 1_000,
+        insecureSkipVerify: true,
+      }).then(async (response) => ({
+        index: i,
+        status: response.status,
+        text: await response.text(),
+      })),
+    );
+
+    const results = await Promise.all(promises);
+    ensure(results.length === 5, "all concurrent requests completed");
+    ensure(
+      results.every((r) => r.status === 200),
+      "all concurrent requests succeeded",
+    );
+    ensure(
+      results.every((r) => r.text === "ok"),
+      "all concurrent responses correct",
+    );
+
+    return { name: "concurrent-requests", success: true };
+  } catch (error) {
+    console.error("concurrent-requests failed", error);
+    return { name: "concurrent-requests", success: false };
+  }
 }
 
 function ensure(condition: unknown, message: string): asserts condition {

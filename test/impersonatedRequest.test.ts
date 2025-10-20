@@ -1,7 +1,6 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import {
   loadCurlImpersonate,
-  impersonatedRequest,
   fetchImpersonated,
   unloadCurlLibrary,
   __bunpersonateInternals,
@@ -283,3 +282,116 @@ runTest.serial.skip(
     */
   },
 );
+
+// Security tests
+test("URL scheme validation rejects file:// URLs", async () => {
+  await expect(
+    buildFetchImpersonatedConfig(new Request("file:///etc/passwd"), {
+      target: "chrome124",
+    }),
+  ).rejects.toThrow(/scheme.*file/i);
+});
+
+test("URL scheme validation rejects ftp:// URLs", async () => {
+  await expect(
+    buildFetchImpersonatedConfig(new Request("ftp://example.com/file.txt"), {
+      target: "chrome124",
+    }),
+  ).rejects.toThrow(/scheme.*ftp/i);
+});
+
+test("URL scheme validation accepts http:// URLs", async () => {
+  const config = await buildFetchImpersonatedConfig(
+    new Request("http://example.com"),
+    { target: "chrome124" },
+  );
+  expect(config.options.url).toBe("http://example.com/");
+});
+
+test("URL scheme validation accepts https:// URLs", async () => {
+  const config = await buildFetchImpersonatedConfig(
+    new Request("https://example.com"),
+    { target: "chrome124" },
+  );
+  expect(config.options.url).toBe("https://example.com/");
+});
+
+test("buildRequestHeaderLines prevents CRLF injection in header values", () => {
+  expect(() =>
+    buildRequestHeaderLines(undefined, {
+      "X-Test": "value\r\nX-Injected: evil",
+    }),
+  ).toThrow(/header.*value/i);
+});
+
+test("buildRequestHeaderLines prevents CRLF injection in header lines", () => {
+  expect(() =>
+    buildRequestHeaderLines(["X-Test: value\r\nX-Injected: evil"], undefined),
+  ).toThrow(/CR.*LF/i);
+});
+
+test("buildRequestHeaderLines validates header names", () => {
+  expect(() =>
+    buildRequestHeaderLines(undefined, {
+      "X-Test\r\n": "value",
+    }),
+  ).toThrow(/header.*name/i);
+});
+
+test("buildRequestHeaderLines accepts valid RFC 7230 header names", () => {
+  const lines = buildRequestHeaderLines(undefined, {
+    "Accept-Language": "en-US",
+    "Content-Type": "application/json",
+    "X-Custom-Header": "value",
+  });
+  expect(lines.length).toBeGreaterThan(0);
+  expect(
+    lines.some((line) => line.toLowerCase().includes("accept-language")),
+  ).toBe(true);
+});
+
+test("maxResponseSize defaults to undefined (applied in impersonatedRequest based on mode)", async () => {
+  const config = await buildFetchImpersonatedConfig(
+    new Request("https://example.com"),
+    { target: "chrome124" },
+  );
+  expect(config.options.maxResponseSize).toBeUndefined();
+});
+
+test("maxResponseSize defaults to unlimited for streaming mode", async () => {
+  const config = await buildFetchImpersonatedConfig(
+    new Request("https://example.com"),
+    { target: "chrome124", responseType: "stream" },
+  );
+  // When responseType is stream and no explicit maxResponseSize,
+  // impersonatedRequest will default to 0 (unlimited)
+  expect(config.options.responseType).toBe("stream");
+  expect(config.options.maxResponseSize).toBeUndefined();
+});
+
+test("maxResponseSize defaults to 100MB for buffered mode", async () => {
+  const config = await buildFetchImpersonatedConfig(
+    new Request("https://example.com"),
+    { target: "chrome124", responseType: "buffer" },
+  );
+  // When responseType is buffer and no explicit maxResponseSize,
+  // impersonatedRequest will default to 100MB
+  expect(config.options.responseType).toBe("buffer");
+  expect(config.options.maxResponseSize).toBeUndefined();
+});
+
+test("maxResponseSize can be customized", async () => {
+  const config = await buildFetchImpersonatedConfig(
+    new Request("https://example.com"),
+    { target: "chrome124", maxResponseSize: 1024 },
+  );
+  expect(config.options.maxResponseSize).toBe(1024);
+});
+
+test("maxResponseSize can be set to 0 for unlimited", async () => {
+  const config = await buildFetchImpersonatedConfig(
+    new Request("https://example.com"),
+    { target: "chrome124", maxResponseSize: 0 },
+  );
+  expect(config.options.maxResponseSize).toBe(0);
+});

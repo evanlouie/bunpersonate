@@ -98,6 +98,10 @@ export interface ImpersonatedRequestOptions {
    * Controls how the response body is exposed. Defaults to "buffer" for backwards compatibility.
    */
   responseType?: "buffer" | "stream";
+  /**
+   * Maximum response body size in bytes. Defaults to 100MB. Set to 0 for unlimited (use with caution).
+   */
+  maxResponseSize?: number;
 }
 
 export interface ImpersonatedFetchInit extends RequestInit {
@@ -107,6 +111,7 @@ export interface ImpersonatedFetchInit extends RequestInit {
   insecureSkipVerify?: boolean;
   loadOptions?: LoadCurlImpersonateOptions;
   responseType?: "buffer" | "stream";
+  maxResponseSize?: number;
 }
 
 /**
@@ -227,8 +232,6 @@ const LIBRARY_BASENAMES = [
 const LIBRARY_EXTENSIONS =
   process.platform === "darwin" ? [".dylib", ".4.dylib"] : [".so", ".so.4"];
 
-const utf8Encoder = new TextEncoder();
-
 const HTTP_HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 
 function assertValidHeaderName(name: string) {
@@ -256,6 +259,33 @@ function assertValidHeaderLine(line: string) {
   }
 }
 
+/**
+ * Validates that a URL uses a safe protocol (http or https only).
+ * Prevents potential security issues from file://, ftp://, etc.
+ */
+function assertValidUrlScheme(url: string) {
+  try {
+    const parsed = new URL(url);
+    const scheme = parsed.protocol.toLowerCase();
+    if (scheme !== "http:" && scheme !== "https:") {
+      throw new TypeError(
+        `Invalid URL scheme "${scheme}". Only http:// and https:// are allowed.`,
+      );
+    }
+  } catch (error) {
+    if (error instanceof TypeError && error.message.includes("scheme")) {
+      throw error;
+    }
+    throw new TypeError(`Invalid URL: ${url}`);
+  }
+}
+
+/**
+ * Encodes a JavaScript string as a null-terminated C string for FFI interop.
+ * @param value - The string to encode
+ * @returns Buffer containing the encoded string and a pointer to it
+ * @internal
+ */
 function encodeCString(value: string): {
   buffer: Uint8Array;
   pointer: Pointer;
@@ -287,6 +317,13 @@ const shimSymbolsDefinition = {
 
 type CurlShimSymbols = typeof shimSymbolsDefinition;
 
+/**
+ * Lazily compiles and loads the C shim library that wraps variadic curl functions.
+ * The shim is needed because Bun's FFI doesn't support true variadic calls.
+ * @returns The compiled shim symbol table
+ * @throws {Error} If the library path is unknown
+ * @internal
+ */
 function getCurlShimSymbols(): Library<CurlShimSymbols>["symbols"] {
   if (!curlShim) {
     if (!loadedLibraryPath) {
@@ -476,7 +513,7 @@ class CurlSlist {
 }
 
 function setOptPointer(
-  lib: CurlLibrary["symbols"],
+  _lib: CurlLibrary["symbols"],
   handle: Pointer,
   option: CurlOption,
   value: Pointer,
@@ -486,7 +523,7 @@ function setOptPointer(
 }
 
 function setOptLong(
-  lib: CurlLibrary["symbols"],
+  _lib: CurlLibrary["symbols"],
   handle: Pointer,
   option: CurlOption,
   value: bigint,
@@ -541,7 +578,7 @@ function setOptNumber(
 }
 
 function getInfoLong(
-  lib: CurlLibrary["symbols"],
+  _lib: CurlLibrary["symbols"],
   handle: Pointer,
   info: number,
   out: Pointer,
@@ -551,7 +588,7 @@ function getInfoLong(
 }
 
 function getInfoPointer(
-  lib: CurlLibrary["symbols"],
+  _lib: CurlLibrary["symbols"],
   handle: Pointer,
   info: number,
   out: Pointer,
@@ -577,6 +614,8 @@ interface PerformContext {
   responseStream?: ReadableStream<Uint8Array> | null;
   responseStreamController?: ReadableStreamDefaultController<Uint8Array> | null;
   streamCancelled?: boolean;
+  maxResponseSize: number;
+  receivedBytes: number;
 }
 
 function createWriteCallback(ctx: PerformContext) {
@@ -589,7 +628,18 @@ function createWriteCallback(ctx: PerformContext) {
       if (ctx.responseMode === "stream" && ctx.streamCancelled) {
         return 0;
       }
+
+      // Check size limit (0 means unlimited)
+      if (ctx.maxResponseSize > 0) {
+        if (ctx.receivedBytes + byteLength > ctx.maxResponseSize) {
+          // Returning 0 or different value than expected signals error to curl
+          return 0;
+        }
+      }
+
       const chunk = new Uint8Array(toArrayBuffer(bufferPtr, 0, byteLength));
+      ctx.receivedBytes += byteLength;
+
       if (ctx.responseMode === "stream" && ctx.responseStreamController) {
         ctx.responseStreamController.enqueue(chunk);
       } else {
@@ -761,6 +811,14 @@ interface NormalizedRequestBody {
   impliedContentType?: string;
 }
 
+/**
+ * Normalizes various body types (Blob, FormData, URLSearchParams, ReadableStream, etc.)
+ * into a Uint8Array that can be passed to curl. Also extracts implied Content-Type.
+ * @param body - The request body in any supported format
+ * @param method - The HTTP method (used for Request constructor)
+ * @returns Normalized body bytes and optional implied Content-Type header
+ * @internal
+ */
 async function normalizeRequestBody(
   body: BodyInit | null,
   method: string,
@@ -865,6 +923,8 @@ export async function impersonatedRequest(
   options: ImpersonatedRequestOptions,
   loadOptions?: LoadCurlImpersonateOptions,
 ): Promise<ImpersonatedResponse> {
+  assertValidUrlScheme(options.url);
+
   const libHandle = loadCurlImpersonate(loadOptions);
 
   const rawHandle = libHandle.symbols.curl_easy_init();
@@ -874,6 +934,13 @@ export async function impersonatedRequest(
   const handle = rawHandle as Pointer;
 
   const responseMode = options.responseType === "stream" ? "stream" : "buffer";
+  const DEFAULT_MAX_RESPONSE_SIZE_BUFFERED = 100 * 1024 * 1024; // 100MB
+  const maxResponseSize =
+    options.maxResponseSize !== undefined
+      ? options.maxResponseSize
+      : responseMode === "stream"
+        ? 0 // unlimited for streaming (no memory concern)
+        : DEFAULT_MAX_RESPONSE_SIZE_BUFFERED;
 
   const ctx: PerformContext = {
     responseChunks: [],
@@ -886,6 +953,8 @@ export async function impersonatedRequest(
     responseStream: null,
     responseStreamController: null,
     streamCancelled: false,
+    maxResponseSize,
+    receivedBytes: 0,
   };
 
   if (responseMode === "stream") {
@@ -1306,6 +1375,7 @@ export async function fetchImpersonated(
     insecureSkipVerify,
     loadOptions,
     responseType,
+    maxResponseSize,
     ...requestInit
   } = init;
 
@@ -1322,6 +1392,7 @@ export async function fetchImpersonated(
     timeoutMs,
     insecureSkipVerify,
     responseType,
+    maxResponseSize,
   });
 
   const responseData = await impersonatedRequest(config.options, loadOptions);
@@ -1335,6 +1406,7 @@ interface BuildFetchConfigInput {
   timeoutMs?: number;
   insecureSkipVerify?: boolean;
   responseType?: "buffer" | "stream";
+  maxResponseSize?: number;
 }
 
 interface FetchImpersonatedConfig {
@@ -1348,10 +1420,12 @@ async function buildFetchImpersonatedConfig(
   request: Request,
   input: BuildFetchConfigInput,
 ): Promise<FetchImpersonatedConfig> {
+  assertValidUrlScheme(request.url);
+
   const redirectMode = (request.redirect ?? "follow") as RedirectMode;
   const headerLines = buildHeaderLines(request.headers);
 
-  let bodyBytes: Uint8Array | undefined;
+  let bodyBytes: BodyInit | null | undefined;
   if (request.body !== null) {
     const buffer = await request.arrayBuffer();
     bodyBytes = new Uint8Array(buffer);
@@ -1371,6 +1445,7 @@ async function buildFetchImpersonatedConfig(
       insecureSkipVerify: input.insecureSkipVerify,
       abortSignal: request.signal,
       responseType: input.responseType ?? "stream",
+      maxResponseSize: input.maxResponseSize,
     },
   };
 }
@@ -1505,6 +1580,13 @@ export const __bunpersonateInternals = {
   buildRequestHeaderLines,
 };
 
+/**
+ * Efficiently concatenates multiple Uint8Array chunks into a single contiguous buffer.
+ * Optimizes for common cases (0 or 1 chunk).
+ * @param chunks - Array of byte chunks to concatenate
+ * @returns Single Uint8Array containing all chunks
+ * @internal
+ */
 function concatenateChunks(chunks: Uint8Array[]): Uint8Array {
   if (chunks.length === 0) {
     return new Uint8Array();
