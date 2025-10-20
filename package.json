@@ -27,7 +27,7 @@
   },
   "homepage": "https://github.com/yourusername/bunpersonate#readme",
   "scripts": {
-    "typecheck": "tsc --noEmit",
+    "typecheck": "bunx -p @typescript/native-preview tsc --noEmit",
     "format": "prettier --check .",
     "format:write": "prettier --write .",
     "test:all": "bun test && bun run test/smoke.ts"

@@ -971,7 +971,10 @@ export async function impersonatedRequest(
 
   try {
     const cleanupHandlers: Array<() => void> = [];
-    const abortSetup = setupAbortSignal(options.abortSignal ?? null, options.timeoutMs);
+    const abortSetup = setupAbortSignal(
+      options.abortSignal ?? null,
+      options.timeoutMs,
+    );
     const abortSignal = abortSetup.signal;
     if (abortSetup.cleanup) {
       cleanupHandlers.push(abortSetup.cleanup);

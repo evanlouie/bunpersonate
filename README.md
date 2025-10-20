@@ -100,6 +100,7 @@ That command runs `bun test` followed by the smoke script (which covers both `im
 High-level Fetch-compatible API for making impersonated requests.
 
 **Parameters:**
+
 - `input: string | URL | Request` - The URL or Request object
 - `init: ImpersonatedFetchInit` - Request configuration (extends standard RequestInit)
   - `target: string` - **Required.** Browser profile to impersonate (e.g., "chrome124", "firefox109", "safari16")
@@ -113,6 +114,7 @@ High-level Fetch-compatible API for making impersonated requests.
 **Returns:** `Promise<Response>` - Standard Fetch API Response object
 
 **Example:**
+
 ```ts
 const response = await fetchImpersonated("https://api.example.com/data", {
   target: "chrome124",
@@ -134,6 +136,7 @@ const data = await response.json();
 Low-level API for direct control over request configuration.
 
 **Parameters:**
+
 - `options: ImpersonatedRequestOptions`
   - `url: string` - Target URL (must be http:// or https://)
   - `target: string` - Browser profile to impersonate
@@ -153,13 +156,14 @@ Low-level API for direct control over request configuration.
   - `skipGlobalInit?: boolean` - Skip curl_global_init() call
 
 **Returns:** `Promise<ImpersonatedResponse>`
+
 ```ts
 interface ImpersonatedResponse {
   statusCode: number;
-  headers: string[];  // Raw header lines
-  body: Uint8Array;   // Response body (empty if responseType is "stream")
-  bodyStream?: ReadableStream<Uint8Array>;  // Present if responseType is "stream"
-  effectiveUrl: string;  // Final URL after redirects
+  headers: string[]; // Raw header lines
+  body: Uint8Array; // Response body (empty if responseType is "stream")
+  bodyStream?: ReadableStream<Uint8Array>; // Present if responseType is "stream"
+  effectiveUrl: string; // Final URL after redirects
 }
 ```
 
@@ -178,12 +182,15 @@ Clean up and unload the curl-impersonate library. Call this when shutting down t
 **Error:** `Unable to locate libcurl-impersonate shared library`
 
 **Solutions:**
+
 1. Set the `CURL_IMPERSONATE_PATH` environment variable:
+
    ```bash
    export CURL_IMPERSONATE_PATH=/path/to/libcurl-impersonate-chrome.dylib
    ```
 
 2. Install curl-impersonate in a standard location:
+
    ```bash
    # macOS (Homebrew)
    brew install curl-impersonate
@@ -214,7 +221,9 @@ Clean up and unload the curl-impersonate library. Call this when shutting down t
 **Cause:** Response exceeds the default 100MB size limit for buffered responses (`responseType: "buffer"`).
 
 **Solutions:**
+
 1. Use streaming mode (recommended for large responses):
+
    ```ts
    const response = await fetchImpersonated(url, {
      target: "chrome124",
@@ -243,6 +252,7 @@ Clean up and unload the curl-impersonate library. Call this when shutting down t
 **Error:** `The operation timed out after Xms`
 
 **Solution:** Increase the timeout or use AbortSignal:
+
 ```ts
 await fetchImpersonated(url, {
   target: "chrome124",
@@ -269,7 +279,9 @@ await fetchImpersonated(url, {
 **Issue:** Many concurrent requests fail or hang
 
 **Solutions:**
+
 1. Limit concurrency:
+
    ```ts
    const limit = 5;
    const chunks = [];
@@ -278,9 +290,9 @@ await fetchImpersonated(url, {
    }
 
    for (const chunk of chunks) {
-     await Promise.all(chunk.map(url =>
-       fetchImpersonated(url, { target: "chrome124" })
-     ));
+     await Promise.all(
+       chunk.map((url) => fetchImpersonated(url, { target: "chrome124" })),
+     );
    }
    ```
 
@@ -301,6 +313,7 @@ MIT
 ## Contributing
 
 Contributions are welcome! Please ensure:
+
 - All tests pass (`bun run test:all`)
 - Code is formatted (`bun run format:write`)
 - TypeScript checks pass (`bun run typecheck`)
